@@ -24,6 +24,7 @@ import openpi.policies.arx_policy as arx_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.policies.libero_subtask_policy as libero_subtask_policy
+import openpi.policies.soarm_policy as soarm_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -528,6 +529,73 @@ class LeRobotLiberoSubtaskDataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotSOARMDataConfig(DataConfigFactory):
+    """Data config for SO-ARM100/107 dual-arm robots (14 DoF, 4 cameras).
+
+    Supports both subtask and non-subtask datasets:
+    - Non-subtask: uses prompt_from_task to resolve task_index -> task text
+    - Subtask: expects literal "task" and "subtask" string columns in parquet
+
+    Camera mapping: front -> base_0_rgb, left_wrist -> left_wrist_0_rgb,
+                    right_wrist -> right_wrist_0_rgb, top -> base_1_rgb
+    """
+
+    # If true, resolve task text from task_index via meta/tasks.parquet.
+    # Set to False when dataset has literal "task" and "subtask" string columns
+    # (e.g., datasets prepared with merge_subtask_datasets.py).
+    prompt_from_task: bool = False
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # Repack mapping: {output_key: input_key_from_dataset}
+        # LeRobot SOARM datasets use "observation.*" prefix and "action" (singular).
+        # OpenPI model expects "images.*", "state", "actions" (plural).
+        repack_mapping: dict[str, str] = {
+            "images.front": "observation.images.front",
+            "images.left_wrist": "observation.images.left_wrist",
+            "images.right_wrist": "observation.images.right_wrist",
+            "images.top": "observation.images.top",
+            "state": "observation.state",
+            "actions": "action",  # LeRobot "action" (singular) -> OpenPI "actions" (plural)
+        }
+
+        if self.prompt_from_task:
+            # Non-subtask: PromptFromLeRobotTask adds "prompt" key from task_index
+            repack_mapping["prompt"] = "prompt"
+        else:
+            # Subtask dataset: literal "task" and "subtask" string columns in parquet
+            repack_mapping["task"] = "task"
+            repack_mapping["subtask"] = "subtask"
+
+        repack_transform = _transforms.Group(
+            inputs=[_transforms.RepackTransform(repack_mapping)]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[soarm_policy.SOARMInputs(model_type=model_config.model_type)],
+            outputs=[soarm_policy.SOARMOutputs()],
+        )
+
+        # Use SubtaskModelTransformFactory when subtask loss is enabled,
+        # otherwise use standard ModelTransformFactory.
+        subtask_weight = getattr(model_config, "subtask_loss_weight", 0.0)
+        if subtask_weight > 0:
+            model_transforms = SubtaskModelTransformFactory()(model_config)
+        else:
+            model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            prompt_from_task=self.prompt_from_task,
+            # LeRobot SOARM uses "action" (singular), not "actions" (plural)
+            action_sequence_keys=("action",),
         )
 
 
@@ -1158,6 +1226,77 @@ _CONFIGS = [
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
         num_train_steps=20_000,
+    ),
+    #
+    # SO-ARM100/107 dual-arm configs.
+    #
+    TrainConfig(
+        name="soarm_pi05_flow",
+        model=pi05_config.Pi05Config(
+            action_horizon=50,
+            max_token_len=200,
+            discrete_state_input=False,
+            subtask_loss_weight=0.15,
+            fast_token_loss_weight=0.15,
+            flow_matching_loss_weight=1.0,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params"
+        ),
+        data=LeRobotSOARMDataConfig(
+            repo_id="thewisp/cylinder_ring_assembly",
+            base_config=DataConfig(
+                asset_id="soarm",
+                use_quantile_norm=True,
+            ),
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000,
+            peak_lr=2.5e-5,
+            decay_steps=30_000,
+            decay_lr=2.5e-6,
+        ),
+        num_train_steps=20_000,
+        save_interval=2000,
+        batch_size=8,
+        fsdp_devices=1,
+        ema_decay=0.999,
+    ),
+    TrainConfig(
+        name="soarm_pi05_flow_lora",
+        model=pi05_config.Pi05Config(
+            action_horizon=50,
+            max_token_len=200,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            subtask_loss_weight=0.15,
+            fast_token_loss_weight=0.15,
+            flow_matching_loss_weight=1.0,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params"
+        ),
+        data=LeRobotSOARMDataConfig(
+            repo_id="thewisp/cylinder_ring_assembly",
+            base_config=DataConfig(
+                asset_id="soarm",
+                use_quantile_norm=True,
+            ),
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000,
+            peak_lr=2.5e-5,
+            decay_steps=30_000,
+            decay_lr=2.5e-6,
+        ),
+        freeze_filter=pi05_config.Pi05Config(
+            paligemma_variant="gemma_2b_lora",
+        ).get_freeze_filter(),
+        num_train_steps=20_000,
+        save_interval=2000,
+        batch_size=2,
+        fsdp_devices=1,
+        ema_decay=None,
     ),
 ]
 
