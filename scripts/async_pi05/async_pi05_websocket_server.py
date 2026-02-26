@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -15,14 +16,20 @@ from websockets.server import WebSocketServerProtocol
 logger = logging.getLogger(__name__)
 
 # Image key mapping: Various input keys -> Model keys.
-# Model expects: base_0_rgb, left_wrist_0_rgb, right_wrist_0_rgb
+# Model expects: base_0_rgb, base_1_rgb, left_wrist_0_rgb, right_wrist_0_rgb
 INPUT_TO_MODEL_IMAGE_KEYS = {
     # LIBERO-style keys -> Model keys
     "agentview_rgb": "base_0_rgb",
     "wrist_rgb_left": "left_wrist_0_rgb",
     "wrist_rgb": "left_wrist_0_rgb",
+    # SOARM-style keys (matches soarm_policy.py SOARMInputs mapping)
+    "front": "base_0_rgb",
+    "top": "base_1_rgb",
+    "left_wrist": "left_wrist_0_rgb",
+    "right_wrist": "right_wrist_0_rgb",
     # Model-style keys (pass-through)
     "base_0_rgb": "base_0_rgb",
+    "base_1_rgb": "base_1_rgb",
     "left_wrist_0_rgb": "left_wrist_0_rgb",
     "right_wrist_0_rgb": "right_wrist_0_rgb",
 }
@@ -70,9 +77,8 @@ def load_norm_stats(checkpoint_path: str | None, config_name: str) -> tuple[dict
     if checkpoint_dir.is_file():
         checkpoint_dir = checkpoint_dir.parent
 
-    search_paths = [
-        checkpoint_dir / "assets" / "KeWangRobotics" / "libero_10_subtasks" / "norm_stats.json",
-    ]
+    # Search for norm_stats.json recursively under checkpoint assets
+    search_paths = list((checkpoint_dir / "assets").rglob("norm_stats.json")) if (checkpoint_dir / "assets").exists() else []
 
     for path in search_paths:
         if path.exists():
@@ -181,6 +187,8 @@ class AsyncPi05WebSocketServer:
             checkpoint_path=checkpoint_path,
         )
         self.clients = set()
+        self.send_locks = {}
+        self.active_refresh_tasks = {}
         self.norm_stats = None  # Will be loaded during initialization
         self.norm_stats_path = None
 
@@ -199,6 +207,11 @@ class AsyncPi05WebSocketServer:
             await task
         except asyncio.CancelledError:
             pass
+
+    async def _send_json(self, websocket: WebSocketServerProtocol, payload: dict[str, Any]) -> None:
+        lock = self.send_locks.setdefault(websocket, asyncio.Lock())
+        async with lock:
+            await websocket.send(json.dumps(payload))
 
     async def unregister_client(self, websocket: WebSocketServerProtocol):
         self.clients.discard(websocket)
@@ -238,7 +251,7 @@ class AsyncPi05WebSocketServer:
         finally:
             await self.unregister_client(websocket)
 
-    async def process_request(self, request: dict[str, Any]) -> dict[str, Any]:
+    async def process_request(self, websocket: WebSocketServerProtocol, request: dict[str, Any]) -> dict[str, Any]:
         """Process inference request - generates subtask first, then actions.
         
         This is a simplified synchronous approach where:
@@ -246,53 +259,65 @@ class AsyncPi05WebSocketServer:
         2. Actions are generated using the subtask as low-level prompt
         3. Both subtask and actions are returned in one response
         """
-        try:
-            # Validate request format
-            if "images" not in request or "high_level_prompt" not in request:
-                return {"error": "Missing required fields: images, high_level_prompt", "status": "error"}
+        # Validate request format
+        if "images" not in request or "high_level_prompt" not in request:
+            return {"error": "Missing required fields: images, high_level_prompt", "status": "error"}
 
-            # Extract request parameters
-            images_data = request["images"]
-            high_level_prompt = request["high_level_prompt"]
-            state = request.get("state")
-            max_decoding_steps = request.get("max_decoding_steps", 25)
-            temperature = request.get("temperature", 0.1)
-            noise = request.get("noise")
+        # Extract request parameters
+        images_data = request["images"]
+        high_level_prompt = request["high_level_prompt"]
+        state = request.get("state")
+        max_decoding_steps = request.get("max_decoding_steps", 25)
+        temperature = request.get("temperature", 0.1)
+        noise = request.get("noise")
+        low_level_prompt = request.get("low_level_prompt", "")
+        generate_subtask = request.get("generate_subtask", True)
+        generate_actions = request.get("generate_actions", True)
+        request_id = request.get("request_id")
+        subtask_refresh_interval = request.get("subtask_refresh_interval")
 
-            # Convert image data
-            images = {}
-            for key, img_data in images_data.items():
-                if isinstance(img_data, list):
-                    img_array = np.array(img_data, dtype=np.uint8)
-                else:
-                    img_array = np.array(img_data, dtype=np.uint8)
-                images[key] = img_array
-            
-            # Map input keys to model keys (base_0_rgb, left_wrist_0_rgb, right_wrist_0_rgb)
-            # This matches LiberoInputs/LiberoSubtaskInputs format
-            images = map_image_keys_to_model(images)
-            print(f"[DEBUG] Mapped image keys: {list(images.keys())}")
+        # Convert image data (supports base64 dict or nested list format)
+        images = {}
+        for key, img_data in images_data.items():
+            if isinstance(img_data, dict) and "base64" in img_data:
+                raw = base64.b64decode(img_data["base64"])
+                img_array = np.frombuffer(raw, dtype=np.uint8).reshape(img_data["shape"])
+            else:
+                img_array = np.array(img_data, dtype=np.uint8)
+            images[key] = img_array
 
-            # Convert state data, normalize (quantile), and pad to 32D (training-time model action dim)
-            state_array = None
-            if state is not None:
-                raw_state = np.array(state, dtype=np.float32)
-                # Log raw gripper state (last 2 dims of 8D state)
-                if len(raw_state) >= 8:
-                    print(f"[GRIPPER DEBUG] Raw gripper state (dims 6-7): {raw_state[6:8]}")
-                # Apply quantile normalization and padding
-                state_array = normalize_state(raw_state, self.norm_stats, pad_to_dim=32, use_quantiles=True)
-                if len(raw_state) >= 8:
-                    print(f"[GRIPPER DEBUG] Quantile-normalized gripper state (dims 6-7): {state_array[6:8]}")
-                print(f"[GRIPPER DEBUG] Full normalized state shape: {state_array.shape}")
+        # Map input keys to model keys (base_0_rgb, left_wrist_0_rgb, right_wrist_0_rgb)
+        # This matches LiberoInputs/LiberoSubtaskInputs format
+        images = map_image_keys_to_model(images)
+        print(f"[DEBUG] Mapped image keys: {list(images.keys())}")
 
-            # Convert noise data
-            noise_array = None
-            if noise is not None:
-                noise_array = np.array(noise, dtype=np.float32)
+        # Convert state data, normalize (quantile), and pad to 32D (training-time model action dim)
+        state_array = None
+        if state is not None:
+            raw_state = np.array(state, dtype=np.float32)
+            # Log raw gripper state (last 2 dims of 8D state)
+            if len(raw_state) >= 8:
+                print(f"[GRIPPER DEBUG] Raw gripper state (dims 6-7): {raw_state[6:8]}")
+            # Apply quantile normalization and padding
+            state_array = normalize_state(raw_state, self.norm_stats, pad_to_dim=32, use_quantiles=True)
+            if len(raw_state) >= 8:
+                print(f"[GRIPPER DEBUG] Quantile-normalized gripper state (dims 6-7): {state_array[6:8]}")
+            print(f"[GRIPPER DEBUG] Full normalized state shape: {state_array.shape}")
 
-            start_time = time.time()
+        # Convert noise data
+        noise_array = None
+        if noise is not None:
+            noise_array = np.array(noise, dtype=np.float32)
 
+        start_time = time.time()
+        subtask = None
+        subtask_tokens = None
+        state_result = None
+        actions = None
+        subtask_ms = 0.0
+        action_ms = 0.0
+
+        if generate_subtask:
             # Step 1: Generate subtask from high-level prompt
             logger.info(f"Generating subtask for: {high_level_prompt}")
             subtask_start = time.time()
@@ -463,7 +488,7 @@ class AsyncPi05WebSocketServer:
             self.port,
             ping_interval=60,
             ping_timeout=60,
-            max_size=10 * 1024 * 1024,
+            max_size=50 * 1024 * 1024,
         )
 
         logger.info("Server started, listening on %s:%s", self.host, self.port)
@@ -496,6 +521,7 @@ async def main():
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper(), logging.INFO),
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        force=True,
     )
 
     os.environ.setdefault("OPENPI_DATA_HOME", os.path.expanduser("~/.cache/openpi"))
