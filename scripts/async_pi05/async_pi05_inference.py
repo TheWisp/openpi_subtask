@@ -152,15 +152,12 @@ class AsyncPi05Inference:
 
         # Prepare state data
         if state is None:
-            state_vec = np.zeros((32,), dtype=np.float32)
+            state_vec = np.zeros((14,), dtype=np.float32)
         else:
             state_vec = np.asarray(state, dtype=np.float32).reshape(-1)
-            if state_vec.shape[0] < 32:
-                state_vec = np.pad(state_vec, ((0, 32 - state_vec.shape[0])), constant_values=0.0)
-            elif state_vec.shape[0] > 32:
-                state_vec = state_vec[:32]
-        state_batch = jnp.asarray(state_vec, dtype=jnp.float32)[np.newaxis, :]
 
+        # Tokenize with original state dim (matches training: TokenizeHighLowPrompt
+        # runs BEFORE PadStatesAndActions, so training sees 14-dim state).
         (
             tokenized_prompt,
             tokenized_prompt_mask,
@@ -169,6 +166,13 @@ class AsyncPi05Inference:
             _subtask_region_mask,
             _action_region_mask,
         ) = self.tokenizer.tokenize_high_low_prompt(high_level_prompt, low_level_prompt, state_vec)
+
+        # Pad state to model action_dim (32) AFTER tokenization (matches PadStatesAndActions).
+        if state_vec.shape[0] < 32:
+            state_vec = np.pad(state_vec, ((0, 32 - state_vec.shape[0])), constant_values=0.0)
+        elif state_vec.shape[0] > 32:
+            state_vec = state_vec[:32]
+        state_batch = jnp.asarray(state_vec, dtype=jnp.float32)[np.newaxis, :]
         # Build observation data
         data = {
             "image": img_dict,

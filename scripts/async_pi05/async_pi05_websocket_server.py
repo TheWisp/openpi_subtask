@@ -36,17 +36,33 @@ INPUT_TO_MODEL_IMAGE_KEYS = {
 
 
 def map_image_keys_to_model(images: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
-    """Map input image keys to model keys and inject a right wrist placeholder when missing."""
-    mapped = {}
+    """Map input image keys to model keys and inject a right wrist placeholder when missing.
+
+    IMPORTANT: Output dict ordering must match training (soarm_policy.py SOARMInputs):
+        base_0_rgb, left_wrist_0_rgb, right_wrist_0_rgb, base_1_rgb
+    """
+    # First pass: rename keys
+    renamed = {}
     for key, value in images.items():
-        mapped[INPUT_TO_MODEL_IMAGE_KEYS.get(key, key)] = value
+        renamed[INPUT_TO_MODEL_IMAGE_KEYS.get(key, key)] = value
 
     # LIBERO normally has only two cameras.
-    if "right_wrist_0_rgb" not in mapped and mapped:
-        template = next(iter(mapped.values()))
-        mapped["right_wrist_0_rgb"] = np.zeros_like(template)
+    if "right_wrist_0_rgb" not in renamed and renamed:
+        template = next(iter(renamed.values()))
+        renamed["right_wrist_0_rgb"] = np.zeros_like(template)
 
-    return mapped
+    # Enforce training-time key order (soarm_policy.py:95)
+    TRAINING_KEY_ORDER = ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb", "base_1_rgb")
+    ordered = {}
+    for key in TRAINING_KEY_ORDER:
+        if key in renamed:
+            ordered[key] = renamed[key]
+    # Append any extra keys not in the training order
+    for key in renamed:
+        if key not in ordered:
+            ordered[key] = renamed[key]
+
+    return ordered
 
 
 def _log_norm_values(norm_stats: dict) -> None:
@@ -291,18 +307,14 @@ class AsyncPi05WebSocketServer:
         images = map_image_keys_to_model(images)
         print(f"[DEBUG] Mapped image keys: {list(images.keys())}")
 
-        # Convert state data, normalize (quantile), and pad to 32D (training-time model action dim)
+        # Convert state data, normalize (quantile) but do NOT pad here.
+        # prepare_observation() will tokenize with original dim then pad to 32
+        # (matching training: TokenizeHighLowPrompt before PadStatesAndActions).
         state_array = None
         if state is not None:
             raw_state = np.array(state, dtype=np.float32)
-            # Log raw gripper state (last 2 dims of 8D state)
-            if len(raw_state) >= 8:
-                print(f"[GRIPPER DEBUG] Raw gripper state (dims 6-7): {raw_state[6:8]}")
-            # Apply quantile normalization and padding
-            state_array = normalize_state(raw_state, self.norm_stats, pad_to_dim=32, use_quantiles=True)
-            if len(raw_state) >= 8:
-                print(f"[GRIPPER DEBUG] Quantile-normalized gripper state (dims 6-7): {state_array[6:8]}")
-            print(f"[GRIPPER DEBUG] Full normalized state shape: {state_array.shape}")
+            # Apply quantile normalization only (no padding)
+            state_array = normalize_state(raw_state, self.norm_stats, pad_to_dim=0, use_quantiles=True)
 
         # Convert noise data
         noise_array = None
