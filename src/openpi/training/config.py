@@ -173,10 +173,10 @@ class SubtaskModelTransformFactory(GroupFactory):
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
         match model_config.model_type:
             case _model.ModelType.PI05:
-                # ⭐ 根据 fast_token_loss_weight 决定是否使用 FAST tokens
+                # Use FAST tokens only if fast_token_loss_weight > 0
                 use_fast_tokens = getattr(model_config, "fast_token_loss_weight", 0.0) > 0
 
-                # ⭐ 创建 tokenizer(带或不带 FAST)
+                # Build tokenizer kwargs (with or without FAST tokenizer path)
                 tokenizer_kwargs = {"max_len": model_config.max_token_len}
                 if use_fast_tokens:
                     fast_tokenizer_path = getattr(model_config, "fast_tokenizer_path", "physical-intelligence/fast")
@@ -782,11 +782,12 @@ _CONFIGS = [
             action_horizon=25,
             max_token_len=256,
             discrete_state_input=False,
-            # ⭐ Only use subtask and FAST token loss
+            # ⭐ Only use action expert loss
             subtask_loss_weight=0.0,
-            fast_token_loss_weight=0.0,  # Enable FAST token loss weight
-            flow_matching_loss_weight=1.0,  # Disable flow matching
+            fast_token_loss_weight=0.0,  
+            flow_matching_loss_weight=1.0,  # Enable flow matching
             fast_tokenizer_path="physical-intelligence/fast",
+            stop_gradient_flow_to_prefix=True,
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader(
             "/home/kewang/.cache/openpi/openpi-checkpoints/libero_pi05_subtask_fast/my_experiment/12000/params"

@@ -101,6 +101,7 @@ class Pi05(_model.BaseModel):
         self.subtask_loss_weight = config.subtask_loss_weight
         self.fast_token_loss_weight = config.fast_token_loss_weight
         self.flow_matching_loss_weight = config.flow_matching_loss_weight
+        self.stop_gradient_flow_to_prefix = config.stop_gradient_flow_to_prefix
 
         # TODO: rewrite gemma in NNX. For now, use bridge.
         llm = nnx_bridge.ToNNX(
@@ -123,13 +124,8 @@ class Pi05(_model.BaseModel):
         img.lazy_init(next(iter(config.fake_obs().images.values())), train=False, rngs=rngs)
         self.PaliGemma = nnx.Dict(llm=llm, img=img)
         self.action_in_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
-        if config.pi05:
-            self.time_mlp_in = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
-            self.time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
-        else:
-            self.state_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
-            self.action_time_mlp_in = nnx.Linear(2 * action_expert_config.width, action_expert_config.width, rngs=rngs)
-            self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
+        self.time_mlp_in = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
+        self.time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
 
         # This attribute gets automatically set by model.train() and model.eval().
@@ -162,8 +158,7 @@ class Pi05(_model.BaseModel):
             tokenized_inputs = self.PaliGemma.llm(obs.tokenized_prompt, method="embed")
             tokens.append(tokenized_inputs)
             input_mask.append(obs.tokenized_prompt_mask)
-            ### TODO: pi0 -> full attention between image and language inputs
-            ### TODO: pi05 -> AR attention for subtask generation, but what about action expert?
+            ### TODO: pi05 -> AR attention for subtask generation
             ar_mask += [True] * tokenized_inputs.shape[1]
         tokens = jnp.concatenate(tokens, axis=1)
         input_mask = jnp.concatenate(input_mask, axis=1)
@@ -323,6 +318,8 @@ class Pi05(_model.BaseModel):
                 positions=prefix_positions,
                 adarms_cond=[None, None],
             )
+            if self.stop_gradient_flow_to_prefix:
+                kv_cache = jax.tree.map(jax.lax.stop_gradient, kv_cache)
 
             noise_rng, time_rng = jax.random.split(rng, 2)
             batch_shape = actions.shape[:-2]
@@ -377,7 +374,6 @@ class Pi05(_model.BaseModel):
 
         prefix_attn_mask = jnp.pad(prefix_attn_mask, ((0, 0), (0, 0), (0, max_decoding_steps)))
         prefix_positions = jnp.cumsum(prefix_mask, axis=-1) - 1
-        # import pdb; pdb.set_trace()
         (prefix_out, _), kv_cache = self.PaliGemma.llm(
             [prefix_token_embeddings, None], mask=prefix_attn_mask, positions=prefix_positions, adarms_cond=[None, None]
         )
