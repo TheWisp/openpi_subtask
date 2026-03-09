@@ -298,10 +298,12 @@ class AsyncPi05WebSocketServer:
             noise = request.get("noise")
             subtask_refresh_interval = request.get("subtask_refresh_interval")
 
-            # Convert image data (supports base64 dict or nested list format)
+            # Convert image data (supports shm_path, base64 dict, or nested list format)
             images = {}
             for key, img_data in images_data.items():
-                if isinstance(img_data, dict) and "base64" in img_data:
+                if isinstance(img_data, dict) and "shm_path" in img_data:
+                    img_array = np.load(img_data["shm_path"])
+                elif isinstance(img_data, dict) and "base64" in img_data:
                     raw = base64.b64decode(img_data["base64"])
                     img_array = np.frombuffer(raw, dtype=np.uint8).reshape(img_data["shape"])
                 else:
