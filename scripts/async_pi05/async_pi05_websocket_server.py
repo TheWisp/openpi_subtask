@@ -327,50 +327,72 @@ class AsyncPi05WebSocketServer:
                 noise_array = np.array(noise, dtype=np.float32)
 
             start_time = time.time()
-            subtask_ms = 0.0
-            action_ms = 0.0
-            subtask = low_level_prompt
-            subtask_tokens = None
             state_result = state_array
-            actions = None
 
-            if generate_subtask:
-                # Step 1: Generate subtask from high-level prompt
-                logger.info("Generating subtask for: %s", high_level_prompt)
-                subtask_start = time.time()
-                subtask_result = await self.inference_engine.infer(
+            if generate_subtask and generate_actions:
+                # Fused single-pass: AR subtask + flow matching actions in one call.
+                # sample_actions() internally runs sample_low_level_task() to generate
+                # the subtask into KV cache, then flow matching uses that same KV cache.
+                # This eliminates the redundant first AR pass (~50% faster).
+                logger.info("Fused inference for: %s", high_level_prompt)
+                result = await self.inference_engine.infer_fused(
                     images=images,
                     high_level_prompt=high_level_prompt,
-                    low_level_prompt=low_level_prompt,
                     state=state_array,
-                    generate_subtask=True,
-                    max_decoding_steps=max_decoding_steps,
-                    temperature=temperature,
-                    noise=None,
-                )
-                subtask_ms = (time.time() - subtask_start) * 1000
-                subtask = subtask_result.get("subtask", "")
-                subtask_tokens = subtask_result.get("subtask_tokens")
-                state_result = subtask_result.get("state", state_result)
-
-            if generate_actions:
-                prompt_for_actions = subtask if subtask is not None else low_level_prompt
-                action_start = time.time()
-                action_result = await self.inference_engine.infer(
-                    images=images,
-                    high_level_prompt=high_level_prompt,
-                    low_level_prompt=prompt_for_actions,
-                    state=state_array,
-                    generate_subtask=False,
-                    max_decoding_steps=max_decoding_steps,
-                    temperature=temperature,
                     noise=noise_array,
                 )
-                action_ms = (time.time() - action_start) * 1000
-                state_result = action_result.get("state", state_result)
-                actions = action_result.get("actions")
+                subtask = result.get("subtask", "")
+                subtask_tokens = result.get("subtask_tokens")
+                actions = result.get("actions")
+                state_result = result.get("state", state_result)
                 if actions is not None:
                     actions = unnormalize_actions(np.asarray(actions), self.norm_stats, use_quantiles=True)
+                subtask_ms = 0.0
+                action_ms = result["timing"]["total_ms"]
+            else:
+                # Fallback: separate passes (for clients that only want subtask or only actions)
+                subtask_ms = 0.0
+                action_ms = 0.0
+                subtask = low_level_prompt
+                subtask_tokens = None
+                actions = None
+
+                if generate_subtask:
+                    logger.info("Generating subtask for: %s", high_level_prompt)
+                    subtask_start = time.time()
+                    subtask_result = await self.inference_engine.infer(
+                        images=images,
+                        high_level_prompt=high_level_prompt,
+                        low_level_prompt=low_level_prompt,
+                        state=state_array,
+                        generate_subtask=True,
+                        max_decoding_steps=max_decoding_steps,
+                        temperature=temperature,
+                        noise=None,
+                    )
+                    subtask_ms = (time.time() - subtask_start) * 1000
+                    subtask = subtask_result.get("subtask", "")
+                    subtask_tokens = subtask_result.get("subtask_tokens")
+                    state_result = subtask_result.get("state", state_result)
+
+                if generate_actions:
+                    prompt_for_actions = subtask if subtask is not None else low_level_prompt
+                    action_start = time.time()
+                    action_result = await self.inference_engine.infer(
+                        images=images,
+                        high_level_prompt=high_level_prompt,
+                        low_level_prompt=prompt_for_actions,
+                        state=state_array,
+                        generate_subtask=False,
+                        max_decoding_steps=max_decoding_steps,
+                        temperature=temperature,
+                        noise=noise_array,
+                    )
+                    action_ms = (time.time() - action_start) * 1000
+                    state_result = action_result.get("state", state_result)
+                    actions = action_result.get("actions")
+                    if actions is not None:
+                        actions = unnormalize_actions(np.asarray(actions), self.norm_stats, use_quantiles=True)
 
             total_ms = (time.time() - start_time) * 1000
 

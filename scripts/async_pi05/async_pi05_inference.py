@@ -252,8 +252,14 @@ class AsyncPi05Inference:
         observation: Observation,
         rng: jax.Array,
         noise: np.ndarray | None = None,
-    ) -> np.ndarray:
-        """Generate action trajectory from observation."""
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Generate action trajectory from observation.
+
+        Returns:
+            (actions, output_tokens) where actions is (50, 32) and output_tokens
+            are the AR-generated subtask tokens from sample_actions()'s internal
+            sample_low_level_task() call.
+        """
 
         def _sample():
             if noise is not None:
@@ -265,7 +271,61 @@ class AsyncPi05Inference:
 
         sampled_actions = await self._run_blocking(_sample, use_model_lock=True)
         # sampled_actions is (x_0, output_tokens) tuple; x_0 shape is (1, 50, 32)
-        return np.array(sampled_actions[0][0])
+        actions = np.array(sampled_actions[0][0])
+        output_tokens = np.array(sampled_actions[1][0], dtype=np.int32)
+        return actions, output_tokens
+
+    async def infer_fused(
+        self,
+        images: dict[str, np.ndarray],
+        high_level_prompt: str,
+        state: np.ndarray | None = None,
+        *,
+        noise: np.ndarray | None = None,
+    ) -> dict[str, Any]:
+        """Single-pass fused inference: AR subtask generation + flow matching actions.
+
+        Instead of two separate passes (generate_subtask then generate_actions),
+        this calls generate_actions() with mask_subtask_tokens=True. Inside
+        sample_actions(), sample_low_level_task() runs AR to generate the subtask
+        into KV cache, then flow matching denoises actions conditioned on that
+        same KV cache. One model forward pass, ~50% faster.
+        """
+        if not self._initialized:
+            await self.initialize()
+
+        start_time = time.time()
+        rng = jax.random.key(int(time.time() * 1000) % 2**32)
+
+        # mask_subtask_tokens=True zeros the subtask region so AR generates it
+        observation = await self._run_blocking(
+            lambda: self.prepare_observation(
+                images,
+                high_level_prompt,
+                "",  # low_level_prompt unused when masking
+                state,
+                mask_subtask_tokens=True,
+            ),
+            use_model_lock=True,
+        )
+
+        actions, output_tokens = await self.generate_actions(observation, rng, noise=noise)
+        subtask_text = self.tokenizer.detokenize(output_tokens).strip()
+
+        total_ms = (time.time() - start_time) * 1000
+        logger.info("Fused inference completed in %.3fs, subtask: %s", total_ms / 1000.0, subtask_text)
+
+        return {
+            "state": np.array(observation.state[0]) if observation.state is not None else None,
+            "actions": actions,
+            "subtask": subtask_text,
+            "subtask_tokens": output_tokens,
+            "timing": {
+                "total_ms": total_ms,
+                "action_ms": total_ms,  # everything is one pass
+                "subtask_ms": 0.0,
+            },
+        }
 
     async def infer(
         self,
@@ -319,7 +379,7 @@ class AsyncPi05Inference:
             subtask_ms = (time.time() - start_time) * 1000
         else:
             action_start_time = time.time()
-            actions = await self.generate_actions(observation, rng, noise=noise)
+            actions, _output_tokens = await self.generate_actions(observation, rng, noise=noise)
             action_ms = (time.time() - action_start_time) * 1000
             subtask_ms = 0.0
             results["actions"] = actions
