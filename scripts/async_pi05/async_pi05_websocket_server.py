@@ -286,6 +286,44 @@ class AsyncPi05WebSocketServer:
             if "images" not in request or "high_level_prompt" not in request:
                 return {"error": "Missing required fields: images, high_level_prompt", "status": "error"}
 
+            # --- S2 latent extraction mode (dual-system VLA) ---
+            if request.get("mode") == "extract_latent":
+                images_data = request["images"]
+                high_level_prompt = request["high_level_prompt"]
+                state = request.get("state")
+
+                # Decode images (same logic as normal inference)
+                images = {}
+                for key, img_data in images_data.items():
+                    if isinstance(img_data, dict) and "shm_path" in img_data:
+                        img_array = np.load(img_data["shm_path"])
+                    elif isinstance(img_data, dict) and "base64" in img_data:
+                        raw = base64.b64decode(img_data["base64"])
+                        img_array = np.frombuffer(raw, dtype=np.uint8).reshape(img_data["shape"])
+                    else:
+                        img_array = np.array(img_data, dtype=np.uint8)
+                    images[key] = img_array
+                images = map_image_keys_to_model(images)
+
+                state_array = None
+                if state is not None:
+                    raw_state = np.array(state, dtype=np.float32)
+                    state_array = normalize_state(raw_state, self.norm_stats, pad_to_dim=0, use_quantiles=True)
+
+                result = await self.inference_engine.extract_latent(
+                    images=images,
+                    high_level_prompt=high_level_prompt,
+                    state=state_array,
+                )
+                response = {
+                    "status": "success",
+                    "s2_latent": result["s2_latent"].tolist(),
+                    "timing": result["timing"],
+                }
+                if request_id is not None:
+                    response["request_id"] = request_id
+                return response
+
             # Extract request parameters
             images_data = request["images"]
             high_level_prompt = request["high_level_prompt"]

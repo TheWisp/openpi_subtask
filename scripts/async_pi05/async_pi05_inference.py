@@ -98,6 +98,7 @@ class AsyncPi05Inference:
         self.tokenizer = PaligemmaTokenizer(max_len=256)
         self.jit_sample_low_level_task = nnx_utils.module_jit(self.model.sample_low_level_task, static_argnums=(3,))
         self.jit_sample_actions = nnx_utils.module_jit(self.model.sample_actions)
+        self.jit_extract_prefix_latent = nnx_utils.module_jit(self.model.extract_prefix_latent)
 
         logger.info("Pi0.5 model initialization completed")
 
@@ -274,6 +275,52 @@ class AsyncPi05Inference:
         actions = np.array(sampled_actions[0][0])
         output_tokens = np.array(sampled_actions[1][0], dtype=np.int32)
         return actions, output_tokens
+
+    async def extract_latent(
+        self,
+        images: dict[str, np.ndarray],
+        high_level_prompt: str,
+        state: np.ndarray | None = None,
+    ) -> dict[str, Any]:
+        """Extract the S2 prefix latent from Pi0.5 without generating actions.
+
+        Runs only the prefix encoding (embed_prefix + LLM forward), then
+        mean-pools to a [2048] vector. Skips AR decoding and flow matching.
+        Cost: ~600ms (same as prefix encoding in full inference).
+        """
+        if not self._initialized:
+            await self.initialize()
+
+        start_time = time.time()
+        rng = jax.random.key(int(time.time() * 1000) % 2**32)
+
+        observation = await self._run_blocking(
+            lambda: self.prepare_observation(
+                images,
+                high_level_prompt,
+                "",
+                state,
+                mask_subtask_tokens=True,
+            ),
+            use_model_lock=True,
+        )
+
+        def _extract():
+            return self.jit_extract_prefix_latent(rng, observation)
+
+        latent = await self._run_blocking(_extract, use_model_lock=True)
+        latent_np = np.array(latent[0])  # [2048]
+
+        total_ms = (time.time() - start_time) * 1000
+        logger.info("Prefix latent extraction completed in %.1fms, shape: %s", total_ms, latent_np.shape)
+
+        return {
+            "s2_latent": latent_np,
+            "timing": {
+                "total_ms": total_ms,
+                "prefix_ms": total_ms,
+            },
+        }
 
     async def infer_fused(
         self,

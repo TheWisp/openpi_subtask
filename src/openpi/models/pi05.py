@@ -438,6 +438,43 @@ class Pi05(_model.BaseModel):
         #  ar_mask [prefix_len+max_decoding_steps]
         return output_tokens, kv_cache, mask, ar_mask
 
+    def extract_prefix_latent(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+    ) -> at.Float[at.Array, "b emb"]:
+        """Extract the mean-pooled prefix encoding as a latent vector.
+
+        Runs embed_prefix() → LLM forward pass, then mean-pools over valid
+        tokens to produce a compact [B, 2048] scene-understanding latent.
+        Skips AR decoding and flow matching — only pays the prefix cost (~600ms).
+        """
+        observation = _model.preprocess_observation(
+            None, observation, train=False, image_keys=list(observation.images.keys())
+        )
+        prefix_token_embeddings, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+
+        # Left-to-right align (same as sample_low_level_task)
+        prefix_token_embeddings, prefix_mask, prefix_attn_mask = left_to_right_align(
+            prefix_token_embeddings, prefix_mask, prefix_attn_mask
+        )
+        prefix_positions = jnp.cumsum(prefix_mask, axis=-1) - 1
+
+        # LLM forward pass — the expensive ~600ms step
+        (prefix_out, _), _kv_cache = self.PaliGemma.llm(
+            [prefix_token_embeddings, None],
+            mask=prefix_attn_mask,
+            positions=prefix_positions,
+            adarms_cond=[None, None],
+        )
+        # prefix_out shape: [B, seq_len, 2048]
+
+        # Mean-pool over valid (masked) tokens → [B, 2048]
+        mask_expanded = prefix_mask[:, :, None].astype(prefix_out.dtype)  # [B, seq_len, 1]
+        pooled = (prefix_out * mask_expanded).sum(axis=1) / mask_expanded.sum(axis=1).clip(min=1.0)
+        return pooled
+
     @override
     def sample_actions(
         self,
