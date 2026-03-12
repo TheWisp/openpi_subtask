@@ -18,11 +18,10 @@ import openpi.shared.nnx_utils as nnx_utils
 from openpi.training.config import get_config
 from openpi.training import weight_loaders
 
-# GPU memory optimization settings
-os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.5"
-os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+# XLA/JAX settings. Use BFC allocator with preallocation (XLA defaults) for
+# best throughput. Do not override MEM_FRACTION here — set it via the launch
+# command (e.g. XLA_PYTHON_CLIENT_MEM_FRACTION=0.9).
 os.environ["JAX_ENABLE_X64"] = "false"
-os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
 
 PALIGEMMA_EOS_TOKEN = 1
 
