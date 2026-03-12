@@ -475,6 +475,96 @@ class Pi05(_model.BaseModel):
         pooled = (prefix_out * mask_expanded).sum(axis=1) / mask_expanded.sum(axis=1).clip(min=1.0)
         return pooled
 
+    def extract_prefix_latent_and_subtask(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        max_decoding_steps: int = 25,
+        paligemma_eos_token: int = 1,
+        temperature: float = 0.1,
+    ) -> tuple[at.Float[at.Array, "b emb"], at.Int[at.Array, "b s"]]:
+        """Extract prefix latent AND decode subtask in a single prefix forward pass.
+
+        Runs embed_prefix() → LLM forward once, then:
+        - Mean-pools prefix_out → [B, 2048] latent
+        - AR-decodes subtask tokens using the kv_cache from that same forward pass
+
+        Cost: ~prefix_ms + ~AR_ms (vs 2× prefix_ms if called separately).
+        Returns: (latent [B, 2048], output_tokens [B, max_decoding_steps])
+        """
+        observation = _model.preprocess_observation(
+            None, observation, train=False, image_keys=list(observation.images.keys())
+        )
+        prefix_token_embeddings, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+
+        prefix_token_embeddings, prefix_mask, prefix_attn_mask = left_to_right_align(
+            prefix_token_embeddings, prefix_mask, prefix_attn_mask
+        )
+        prefill_size = prefix_token_embeddings.shape[1]
+        prefill_len = jnp.sum(prefix_mask, axis=-1)
+        prefix_start = prefill_size - prefill_len
+        prefix_positions = jnp.cumsum(prefix_mask, axis=-1) - 1
+
+        # Pad mask for AR decoding steps (same as sample_low_level_task)
+        prefix_attn_mask_ar = jnp.pad(prefix_attn_mask, ((0, 0), (0, 0), (0, max_decoding_steps)))
+
+        # Single LLM forward — shared for both latent and subtask AR decoding
+        (prefix_out, _), kv_cache = self.PaliGemma.llm(
+            [prefix_token_embeddings, None],
+            mask=prefix_attn_mask_ar,
+            positions=prefix_positions,
+            adarms_cond=[None, None],
+        )
+
+        # Latent: mean-pool over valid tokens → [B, 2048]
+        mask_expanded = prefix_mask[:, :, None].astype(prefix_out.dtype)
+        latent = (prefix_out * mask_expanded).sum(axis=1) / mask_expanded.sum(axis=1).clip(min=1.0)
+
+        # Subtask: AR decode from kv_cache (same loop as sample_low_level_task)
+        batch_size = prefix_token_embeddings.shape[0]
+        last_token_embedding = prefix_out[:, -1:]
+        last_logits = self.PaliGemma.llm(last_token_embedding, method="deembed")
+        last_logits = jax.nn.log_softmax(last_logits, axis=-1)
+        output_tokens = jnp.zeros((batch_size, max_decoding_steps))
+
+        def step(carry):
+            rng, last_logit, output_tokens, cache, _, step = carry
+            rng, rng_step = jax.random.split(rng)
+            token = jax.lax.cond(
+                temperature > 0.0,
+                lambda _: jax.random.categorical(rng_step, last_logit / temperature, axis=-1),
+                lambda _: jnp.argmax(last_logit, axis=-1),
+                operand=None,
+            )
+            output_tokens = put_along_last_axis(output_tokens, jnp.broadcast_to(step, (token.shape[0], 1)), token)
+            has_eos = jnp.any(token == paligemma_eos_token, axis=-1)
+            all_eos = jnp.all(has_eos)
+            token_embedding = self.PaliGemma.llm(token, method="embed")
+            positions = prefill_len[:, None] + step
+            mask = jnp.logical_and(
+                jnp.arange(prefill_size + max_decoding_steps)[None, None, :] >= prefix_start[:, None, None],
+                jnp.arange(prefill_size + max_decoding_steps)[None, None, :]
+                < (jnp.broadcast_to(prefill_size + step + 1, (prefix_start.shape[0], 1, 1))),
+            )
+            (prefix_out, _), kv_cache = self.PaliGemma.llm(
+                [token_embedding, None], mask=mask, positions=positions, adarms_cond=[None, None], kv_cache=cache
+            )
+            last_token_embedding = prefix_out[:, -1:]
+            last_logits = self.PaliGemma.llm(last_token_embedding, method="deembed")
+            last_logits = jax.nn.log_softmax(last_logits, axis=-1)
+            return rng, last_logits, output_tokens, kv_cache, all_eos, step + 1
+
+        def cond(carry):
+            _, _, _, _, all_eos, step = carry
+            return (~all_eos) & (step < max_decoding_steps)
+
+        _, _, output_tokens, _, _, _ = jax.lax.while_loop(
+            cond, step, (rng, last_logits, output_tokens, kv_cache, False, 0)
+        )
+
+        return latent, output_tokens
+
     @override
     def sample_actions(
         self,

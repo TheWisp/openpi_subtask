@@ -47,6 +47,7 @@ class AsyncPi05Inference:
         self.tokenizer = None
         self.jit_sample_low_level_task = None
         self.jit_sample_actions = None
+        self.jit_extract_prefix_latent_and_subtask = None
 
         self._initialized = False
         self._initialize_lock = asyncio.Lock()
@@ -99,6 +100,7 @@ class AsyncPi05Inference:
         self.jit_sample_low_level_task = nnx_utils.module_jit(self.model.sample_low_level_task, static_argnums=(3,))
         self.jit_sample_actions = nnx_utils.module_jit(self.model.sample_actions)
         self.jit_extract_prefix_latent = nnx_utils.module_jit(self.model.extract_prefix_latent)
+        self.jit_extract_prefix_latent_and_subtask = nnx_utils.module_jit(self.model.extract_prefix_latent_and_subtask, static_argnums=(3,))
 
         logger.info("Pi0.5 model initialization completed")
 
@@ -319,6 +321,52 @@ class AsyncPi05Inference:
             "timing": {
                 "total_ms": total_ms,
                 "prefix_ms": total_ms,
+            },
+        }
+
+    async def extract_latent_with_subtask(
+        self,
+        images: dict[str, np.ndarray],
+        high_level_prompt: str,
+        state: np.ndarray | None = None,
+    ) -> dict[str, Any]:
+        """Extract prefix latent AND decode subtask in a single prefix forward pass.
+
+        Cost: ~prefix_ms + ~AR_ms (vs 2× prefix_ms if called separately).
+        """
+        if not self._initialized:
+            await self.initialize()
+
+        start_time = time.time()
+        rng = jax.random.key(int(time.time() * 1000) % 2**32)
+
+        observation = await self._run_blocking(
+            lambda: self.prepare_observation(
+                images,
+                high_level_prompt,
+                "",
+                state,
+                mask_subtask_tokens=True,
+            ),
+            use_model_lock=True,
+        )
+
+        def _extract():
+            return self.jit_extract_prefix_latent_and_subtask(rng, observation)
+
+        latent, output_tokens = await self._run_blocking(_extract, use_model_lock=True)
+        latent_np = np.array(latent[0])  # [2048]
+        subtask_text = self.tokenizer.detokenize(np.array(output_tokens[0], dtype=np.int32)).strip()
+
+        total_ms = (time.time() - start_time) * 1000
+        prefix_ms = total_ms  # approximate; AR is fast relative to prefix
+
+        return {
+            "s2_latent": latent_np,
+            "subtask": subtask_text,
+            "timing": {
+                "total_ms": total_ms,
+                "prefix_ms": prefix_ms,
             },
         }
 

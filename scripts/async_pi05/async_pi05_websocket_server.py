@@ -310,16 +310,26 @@ class AsyncPi05WebSocketServer:
                     raw_state = np.array(state, dtype=np.float32)
                     state_array = normalize_state(raw_state, self.norm_stats, pad_to_dim=0, use_quantiles=True)
 
-                result = await self.inference_engine.extract_latent(
-                    images=images,
-                    high_level_prompt=high_level_prompt,
-                    state=state_array,
-                )
+                with_subtask = request.get("with_subtask", False)
+                if with_subtask:
+                    result = await self.inference_engine.extract_latent_with_subtask(
+                        images=images,
+                        high_level_prompt=high_level_prompt,
+                        state=state_array,
+                    )
+                else:
+                    result = await self.inference_engine.extract_latent(
+                        images=images,
+                        high_level_prompt=high_level_prompt,
+                        state=state_array,
+                    )
                 response = {
                     "status": "success",
                     "s2_latent": result["s2_latent"].tolist(),
                     "timing": result["timing"],
                 }
+                if "subtask" in result:
+                    response["subtask"] = result["subtask"]
                 if request_id is not None:
                     response["request_id"] = request_id
                 return response
