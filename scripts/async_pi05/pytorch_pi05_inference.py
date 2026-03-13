@@ -186,8 +186,14 @@ class PyTorchPi05Inference:
         high_level_prompt: str,
         low_level_prompt: str = "",
         state: np.ndarray | None = None,
+        subtask_token_ids: list[int] | None = None,
     ) -> SimpleObservation:
-        """Convert raw images + text into a SimpleObservation for PyTorch preprocessing."""
+        """Convert raw images + text into a SimpleObservation for PyTorch preprocessing.
+
+        If subtask_token_ids is provided, those raw token IDs (e.g. from AR decoding,
+        including FAST tokens) are spliced directly into the subtask region instead of
+        re-encoding low_level_prompt as text. This preserves FAST token conditioning.
+        """
         if state is None:
             state_vec = np.zeros((14,), dtype=np.float32)
         else:
@@ -199,9 +205,55 @@ class PyTorchPi05Inference:
             tokenized_prompt_mask,
             token_ar_mask,
             token_loss_mask,
-            _subtask_region_mask,
+            subtask_region_mask,
             _action_region_mask,
         ) = self.tokenizer.tokenize_high_low_prompt(high_level_prompt, low_level_prompt, state_vec)
+
+        if subtask_token_ids is not None:
+            # Splice raw decoded token IDs (including FAST tokens) directly into the
+            # subtask region, bypassing text re-encoding that would discard FAST tokens.
+            # subtask_region_mask marks where the empty subtask placeholder was placed;
+            # we replace those positions with our decoded tokens + suffix + EOS.
+            EOS = 1
+            subtask_region_np = np.asarray(subtask_region_mask, dtype=bool)
+            prefix_len = int(np.argmax(subtask_region_np))  # index where subtask region starts
+
+            # subtask_token_ids already contain ";\nAction: " + FAST tokens + "|"
+            # (AR decode stops before EOS). Just re-append EOS to close the sequence.
+            new_subtask_seq = list(subtask_token_ids) + [EOS]
+
+            max_len = len(tokenized_prompt)
+            available = max_len - prefix_len
+            if len(new_subtask_seq) > available:
+                logger.warning(
+                    "Subtask+suffix length %d exceeds available %d positions, truncating",
+                    len(new_subtask_seq), available,
+                )
+                new_subtask_seq = new_subtask_seq[:available]
+
+            n_new = len(new_subtask_seq)
+            tokenized_prompt = list(tokenized_prompt)
+            tokenized_prompt_mask = list(tokenized_prompt_mask)
+            token_ar_mask = list(token_ar_mask)
+            token_loss_mask = list(token_loss_mask)
+
+            # Fill subtask region with decoded tokens, then pad remainder
+            for i, tok in enumerate(new_subtask_seq):
+                tokenized_prompt[prefix_len + i] = tok
+                tokenized_prompt_mask[prefix_len + i] = True
+                token_ar_mask[prefix_len + i] = 1
+                token_loss_mask[prefix_len + i] = True
+            # Zero out any remaining positions after the new subtask sequence
+            for i in range(n_new, max_len - prefix_len):
+                tokenized_prompt[prefix_len + i] = 0
+                tokenized_prompt_mask[prefix_len + i] = False
+                token_ar_mask[prefix_len + i] = 0
+                token_loss_mask[prefix_len + i] = False
+
+            tokenized_prompt = np.asarray(tokenized_prompt, dtype=np.int32)
+            tokenized_prompt_mask = np.asarray(tokenized_prompt_mask, dtype=bool)
+            token_ar_mask = np.asarray(token_ar_mask, dtype=np.int32)
+            token_loss_mask = np.asarray(token_loss_mask, dtype=bool)
 
         # Pad/clip state to action_dim=32
         if state_vec.shape[0] < 32:
@@ -232,9 +284,9 @@ class PyTorchPi05Inference:
         ar_mask_t = torch.from_numpy(np.array(token_ar_mask)).to(dev).unsqueeze(0).long()
         loss_mask_t = torch.from_numpy(np.array(token_loss_mask)).to(dev).unsqueeze(0).bool()
 
-        # Zero out subtask region tokens so the prefix ends at "Subtask: "
-        if token_loss_mask is not None:
-            loss_mask_np = np.array(token_loss_mask)
+        if subtask_token_ids is None:
+            # For subtask decoding pass: zero out subtask region so prefix ends at "Subtask: "
+            loss_mask_np = np.array(token_loss_mask) if not isinstance(token_loss_mask, np.ndarray) else token_loss_mask
             prompt_t[0, loss_mask_np] = 0
             prompt_mask_t[0, loss_mask_np] = False
 
@@ -288,6 +340,7 @@ class PyTorchPi05Inference:
     ) -> dict[str, Any]:
         """Full Pi0.5 inference: AR-decode subtask, then generate action chunk.
 
+        Subtask is re-decoded every subtask_interval calls; cached otherwise.
         Returns dict with 'actions', 'subtask' (str), and 'timing'.
         """
         if not self._initialized:
@@ -314,12 +367,20 @@ class PyTorchPi05Inference:
                 subtask_text = self.tokenizer.detokenize(np.array(subtask_tokens))
                 if ";" in subtask_text:
                     subtask_text = subtask_text.split(";")[0].strip()
-                logger.info("Decoded subtask: %r (tokens=%d)", subtask_text, len(subtask_tokens))
+                logger.info(
+                    "Decoded subtask: %r  raw_tokens=%s",
+                    subtask_text, subtask_tokens,
+                )
             except Exception as e:
                 logger.warning("Failed to detokenize subtask tokens %s: %s", subtask_tokens, e)
 
+        # Splice raw decoded token IDs (including FAST tokens) directly into the prefix
+        # instead of re-encoding text — preserves FAST token conditioning for flow matching.
+        _st = subtask_tokens
         obs_for_actions = await self._run_blocking(
-            lambda: self._prepare_observation(images, high_level_prompt, subtask_text, state),
+            lambda: self._prepare_observation(
+                images, high_level_prompt, "", state, subtask_token_ids=_st if _st else None
+            ),
         )
 
         def _generate():
