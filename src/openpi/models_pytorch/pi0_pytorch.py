@@ -6,7 +6,11 @@ from torch import Tensor
 from torch import nn
 import torch.nn.functional as F  # noqa: N812
 
-import openpi.models.gemma as _gemma
+try:
+    import openpi.models.gemma as _gemma
+except ImportError:
+    # JAX/Flax not available — use the lightweight pure-Python config
+    import openpi.models_pytorch.gemma_config_lite as _gemma  # type: ignore[no-redef]
 from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
 
@@ -158,9 +162,12 @@ class PI0Pytorch(nn.Module):
         att_2d_masks_4d = att_2d_masks[:, None, :, :]
         return torch.where(att_2d_masks_4d, 0.0, -2.3819763e38)
 
-    def _preprocess_observation(self, observation, *, train=True):
+    def _preprocess_observation(self, observation, *, train=True, image_keys=None):
         """Helper method to preprocess observation."""
-        observation = _preprocessing.preprocess_observation_pytorch(observation, train=train)
+        kwargs = {"train": train}
+        if image_keys is not None:
+            kwargs["image_keys"] = image_keys
+        observation = _preprocessing.preprocess_observation_pytorch(observation, **kwargs)
         return (
             list(observation.images.values()),
             list(observation.image_masks.values()),
@@ -373,14 +380,142 @@ class PI0Pytorch(nn.Module):
         return F.mse_loss(u_t, v_t, reduction="none")
 
     @torch.no_grad()
-    def sample_actions(self, device, observation, noise=None, num_steps=10) -> Tensor:
+    def extract_prefix_latent(self, device, observation, image_keys=None) -> Tensor:
+        """Extract a scene-understanding latent by mean-pooling the PaliGemma prefix output.
+
+        Returns a [B, 2048] tensor representing the S2 latent for dual-system VLA inference.
+        Skips action denoising entirely — ~150ms vs ~560ms for full inference.
+
+        Args:
+            image_keys: Optional sequence of image keys to process. If None, uses
+                        preprocessing default (3 cameras). Pass 4 keys for SOARM.
+        """
+        if image_keys is not None:
+            processed = _preprocessing.preprocess_observation_pytorch(
+                observation, train=False, image_keys=image_keys
+            )
+            images = list(processed.images.values())
+            img_masks = list(processed.image_masks.values())
+            lang_tokens = processed.tokenized_prompt
+            lang_masks = processed.tokenized_prompt_mask
+        else:
+            images, img_masks, lang_tokens, lang_masks, _ = self._preprocess_observation(observation, train=False)
+
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+
+        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
+        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+
+        (prefix_out, _), _, _ = self.paligemma_with_expert.forward(
+            attention_mask=prefix_att_2d_masks_4d,
+            position_ids=prefix_position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=False,
+        )
+
+        # Mean-pool over valid prefix tokens → [B, 2048]
+        mask = prefix_pad_masks[:, :, None].to(dtype=prefix_out.dtype)
+        pooled = (prefix_out * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1.0)
+        return pooled
+
+    @torch.no_grad()
+    def sample_low_level_task(self, device, observation, max_decoding_steps=20, image_keys=None) -> list:
+        """AR-decode a subtask description from the PaliGemma prefix LM.
+
+        Mirrors the JAX `sample_low_level_task` logic: runs the prefix forward with
+        KV-cache enabled, then greedily decodes tokens one-by-one until EOS or
+        `max_decoding_steps` is reached.
+
+        Returns a list of integer token IDs (not including EOS).
+        """
+        if image_keys is not None:
+            processed = _preprocessing.preprocess_observation_pytorch(
+                observation, train=False, image_keys=image_keys
+            )
+            images = list(processed.images.values())
+            img_masks = list(processed.image_masks.values())
+            lang_tokens = processed.tokenized_prompt
+            lang_masks = processed.tokenized_prompt_mask
+        else:
+            images, img_masks, lang_tokens, lang_masks, _ = self._preprocess_observation(observation, train=False)
+
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+
+        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
+        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+
+        (prefix_out, _), past_kv, _ = self.paligemma_with_expert.forward(
+            attention_mask=prefix_att_2d_masks_4d,
+            position_ids=prefix_position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=True,
+        )
+
+        # Logits from the last VALID prefix token → first generated token
+        # (last position may be padding; use the last True index in pad_masks)
+        last_valid_idx = int(torch.where(prefix_pad_masks[0])[0][-1].item())
+        logits = self.paligemma_with_expert.deembed(prefix_out[:, last_valid_idx : last_valid_idx + 1])  # [B, 1, vocab]
+        next_token = logits[:, 0].argmax(dim=-1, keepdim=True)  # [B, 1]
+
+        prefix_len = prefix_embs.shape[1]
+        prefix_valid_len = int(prefix_pad_masks[0].sum().item())
+        hidden_dim = prefix_embs.shape[-1]
+        emb_scale = math.sqrt(hidden_dim)
+
+        EOS_TOKEN = 1
+        output_tokens = []
+
+        for step in range(max_decoding_steps):
+            tok = next_token[0, 0].item()
+            if tok == EOS_TOKEN:
+                break
+            output_tokens.append(tok)
+
+            # Embed the generated token (with same scale as embed_prefix)
+            token_emb = self.paligemma_with_expert.embed_language_tokens(next_token)  # [B, 1, D]
+            token_emb = token_emb * emb_scale
+            token_emb = token_emb.to(dtype=prefix_embs.dtype)
+
+            # Position: right after all valid prefix tokens
+            pos_ids = torch.tensor([[prefix_valid_len + step]], device=device, dtype=torch.long)
+
+            # Attention mask: current AR token attends to valid prefix positions + all AR tokens.
+            # Match denoise_step approach: mask out padded prefix positions (garbage KV values).
+            NEG_INF = -2.3819763e38
+            cross = torch.where(prefix_pad_masks[0], 0.0, NEG_INF)  # [prefix_len], float32
+            ar_part = torch.zeros(step + 1, device=device, dtype=torch.float32)
+            ar_att_4d = torch.cat([cross, ar_part], dim=0).reshape(1, 1, 1, -1)
+
+            (ar_out, _), past_kv, _ = self.paligemma_with_expert.forward(
+                attention_mask=ar_att_4d,
+                position_ids=pos_ids,
+                past_key_values=past_kv,
+                inputs_embeds=[token_emb, None],
+                use_cache=True,
+            )
+
+            logits = self.paligemma_with_expert.deembed(ar_out[:, -1:])  # [B, 1, vocab]
+            next_token = logits[:, 0].argmax(dim=-1, keepdim=True)
+
+        return output_tokens
+
+    @torch.no_grad()
+    def sample_actions(self, device, observation, noise=None, num_steps=10, image_keys=None) -> Tensor:
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
         bsize = observation.state.shape[0]
         if noise is None:
             actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
             noise = self.sample_noise(actions_shape, device)
 
-        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
+        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(
+            observation, train=False, image_keys=image_keys
+        )
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
@@ -390,7 +525,7 @@ class PI0Pytorch(nn.Module):
         prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
         self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
 
-        _, past_key_values = self.paligemma_with_expert.forward(
+        _, past_key_values, _ = self.paligemma_with_expert.forward(
             attention_mask=prefix_att_2d_masks_4d,
             position_ids=prefix_position_ids,
             past_key_values=None,
@@ -446,7 +581,7 @@ class PI0Pytorch(nn.Module):
         full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
         self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
 
-        outputs_embeds, _ = self.paligemma_with_expert.forward(
+        outputs_embeds, _, _ = self.paligemma_with_expert.forward(
             attention_mask=full_att_2d_masks_4d,
             position_ids=position_ids,
             past_key_values=past_key_values,

@@ -2,13 +2,18 @@ import logging
 import os
 import string
 
-import jax
+try:
+    import jax
+    import orbax.checkpoint as ocp
+    import openpi.models.utils.fsq_tokenizer as fsq_tokenizer
+    _JAX_AVAILABLE = True
+except ImportError:
+    _JAX_AVAILABLE = False
+
 import numpy as np
-import orbax.checkpoint as ocp
 import sentencepiece
 from transformers import AutoProcessor
 
-import openpi.models.utils.fsq_tokenizer as fsq_tokenizer
 import openpi.shared.download as download
 
 
