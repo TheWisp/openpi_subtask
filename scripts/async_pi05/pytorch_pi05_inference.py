@@ -150,6 +150,20 @@ class PyTorchPi05Inference:
 
         self.model = model.to(self.device).eval()
 
+        # Compile the PaliGemma language model forward for faster AR decode.
+        # dynamic=True handles the growing KV cache and changing attention mask shapes.
+        # reduce-overhead mode minimizes per-step CUDA kernel launch overhead.
+        # Note: first inference after warmup will still be slow (recompilation on new shapes).
+        try:
+            self.model.paligemma_with_expert.forward = torch.compile(
+                self.model.paligemma_with_expert.forward,
+                dynamic=True,
+                mode="reduce-overhead",
+            )
+            logger.info("torch.compile applied to paligemma_with_expert.forward")
+        except Exception as e:
+            logger.warning("torch.compile failed, falling back to eager: %s", e)
+
         try:
             from openpi.models.tokenizer import PaligemmaTokenizer
             self.tokenizer = PaligemmaTokenizer(max_len=256)
@@ -337,10 +351,12 @@ class PyTorchPi05Inference:
         high_level_prompt: str,
         state: np.ndarray | None = None,
         num_steps: int = 10,
+        max_ar_steps: int = 20,
     ) -> dict[str, Any]:
         """Full Pi0.5 inference: AR-decode subtask, then generate action chunk.
 
-        Subtask is re-decoded every subtask_interval calls; cached otherwise.
+        Subtask tokens (including FAST tokens) are spliced at their correct positions
+        in the language buffer before the action prefix forward, matching training layout.
         Returns dict with 'actions', 'subtask' (str), and 'timing'.
         """
         if not self._initialized:
@@ -348,18 +364,20 @@ class PyTorchPi05Inference:
 
         start_time = time.time()
 
-        obs_for_subtask = await self._run_blocking(
+        obs = await self._run_blocking(
             lambda: self._prepare_observation(images, high_level_prompt, "", state),
         )
 
         def _decode_subtask():
+            t0 = time.time()
             with torch.no_grad():
-                return self.model.sample_low_level_task(
-                    self.device, obs_for_subtask, max_decoding_steps=20, image_keys=self.image_keys
+                toks = self.model.sample_low_level_task(
+                    self.device, obs, max_decoding_steps=max_ar_steps,
+                    image_keys=self.image_keys, return_cache=False,
                 )
+            return toks, (time.time() - t0) * 1000
 
-        subtask_tokens = await self._run_blocking(_decode_subtask, use_model_lock=True)
-        subtask_ms = (time.time() - start_time) * 1000
+        subtask_tokens, subtask_ms = await self._run_blocking(_decode_subtask, use_model_lock=True)
 
         subtask_text = ""
         if subtask_tokens:
@@ -374,8 +392,8 @@ class PyTorchPi05Inference:
             except Exception as e:
                 logger.warning("Failed to detokenize subtask tokens %s: %s", subtask_tokens, e)
 
-        # Splice raw decoded token IDs (including FAST tokens) directly into the prefix
-        # instead of re-encoding text — preserves FAST token conditioning for flow matching.
+        # Build action obs with subtask tokens spliced at the correct positions
+        # (within the fixed-length language buffer, matching training layout).
         _st = subtask_tokens
         obs_for_actions = await self._run_blocking(
             lambda: self._prepare_observation(
@@ -384,22 +402,23 @@ class PyTorchPi05Inference:
         )
 
         def _generate():
+            t0 = time.time()
             with torch.no_grad():
                 actions = self.model.sample_actions(
-                    self.device, obs_for_actions, num_steps=num_steps, image_keys=self.image_keys
+                    self.device, obs_for_actions, num_steps=num_steps, image_keys=self.image_keys,
                 )
-            return actions[0].float().cpu().numpy()  # [action_horizon, action_dim]
+            return actions[0].float().cpu().numpy(), (time.time() - t0) * 1000
 
-        actions_np = await self._run_blocking(_generate, use_model_lock=True)
+        actions_np, action_ms = await self._run_blocking(_generate, use_model_lock=True)
         actions_np = self._unnormalize_actions(actions_np)
 
         total_ms = (time.time() - start_time) * 1000
         logger.info(
             "Full infer: subtask_ms=%.1f action_ms=%.1f total_ms=%.1f subtask=%r",
-            subtask_ms, total_ms - subtask_ms, total_ms, subtask_text,
+            subtask_ms, action_ms, total_ms, subtask_text,
         )
         return {
             "actions": actions_np.tolist(),
             "subtask": subtask_text,
-            "timing": {"total_ms": total_ms, "subtask_ms": subtask_ms, "action_ms": total_ms - subtask_ms},
+            "timing": {"total_ms": total_ms, "subtask_ms": subtask_ms, "action_ms": action_ms},
         }

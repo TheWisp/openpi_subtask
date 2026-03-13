@@ -86,9 +86,13 @@ class PyTorchPi05Server:
         host: str = "0.0.0.0",
         port: int = 8765,
         norm_stats_path: str | None = None,
+        num_steps: int = 10,
+        max_ar_steps: int = 20,
     ):
         self.host = host
         self.port = port
+        self.num_steps = num_steps
+        self.max_ar_steps = max_ar_steps
         self.engine = PyTorchPi05Inference(
             checkpoint_path=checkpoint_path,
             device=device,
@@ -139,7 +143,8 @@ class PyTorchPi05Server:
                 "timing": result["timing"],
             }
         else:
-            result = await self.engine.infer(images, high_level_prompt, state=state_arr)
+            result = await self.engine.infer(images, high_level_prompt, state=state_arr,
+                                              num_steps=self.num_steps, max_ar_steps=self.max_ar_steps)
             return {
                 "status": "success",
                 "actions": result["actions"],
@@ -176,6 +181,10 @@ async def main():
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    parser.add_argument("--num-steps", type=int, default=10,
+                        help="Flow-matching denoising steps (10=default quality, 5=faster, 3=fastest)")
+    parser.add_argument("--max-ar-steps", type=int, default=20,
+                        help="Max AR tokens to decode for subtask (20=full FAST, 12=text+few FAST, 9=text only)")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -189,6 +198,8 @@ async def main():
         host=args.host,
         port=args.port,
         norm_stats_path=args.norm_stats,
+        num_steps=args.num_steps,
+        max_ar_steps=args.max_ar_steps,
     )
     await server.start()
 
