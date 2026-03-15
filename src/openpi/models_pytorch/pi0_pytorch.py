@@ -422,6 +422,106 @@ class PI0Pytorch(nn.Module):
         return pooled
 
     @torch.no_grad()
+    def extract_prefix_latent_and_subtask(self, device, observation, max_decoding_steps=20, image_keys=None, temperature=0.0):
+        """Single prefix forward → latent (mean-pool) + AR subtask decoding from KV cache.
+
+        Args:
+            temperature: 0.0 = greedy argmax, >0.0 = sample from softmax(logits/T).
+                         Higher values explore more diverse subtasks.
+
+        Returns (pooled_latent [B, 2048], output_tokens list[int]).
+        """
+        if image_keys is not None:
+            processed = _preprocessing.preprocess_observation_pytorch(
+                observation, train=False, image_keys=image_keys
+            )
+            images = list(processed.images.values())
+            img_masks = list(processed.image_masks.values())
+            lang_tokens = processed.tokenized_prompt
+            lang_masks = processed.tokenized_prompt_mask
+        else:
+            images, img_masks, lang_tokens, lang_masks, _ = self._preprocess_observation(observation, train=False)
+
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+
+        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
+        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+
+        # Single prefix forward with cache
+        (prefix_out, _), past_kv, _ = self.paligemma_with_expert.forward(
+            attention_mask=prefix_att_2d_masks_4d,
+            position_ids=prefix_position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=True,
+        )
+
+        # Extract latent via mean-pooling
+        mask = prefix_pad_masks[:, :, None].to(dtype=prefix_out.dtype)
+        pooled = (prefix_out * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1.0)
+
+        # AR-decode subtask from KV cache
+        def _sample_token(logits_2d):
+            """Sample or argmax from [B, vocab] logits based on temperature."""
+            if temperature <= 0.0:
+                return logits_2d.argmax(dim=-1, keepdim=True)
+            probs = torch.softmax(logits_2d / temperature, dim=-1)
+            return torch.multinomial(probs, num_samples=1)
+
+        last_valid_idx = int(torch.where(prefix_pad_masks[0])[0][-1].item())
+        logits = self.paligemma_with_expert.deembed(prefix_out[:, last_valid_idx : last_valid_idx + 1])
+        next_token = _sample_token(logits[:, 0])
+
+        prefix_valid_len = int(prefix_pad_masks[0].sum().item())
+        hidden_dim = prefix_embs.shape[-1]
+        emb_scale = math.sqrt(hidden_dim)
+
+        EOS_TOKEN = 1
+        output_tokens = []
+        # Collect top-k info at each AR step for debugging
+        topk_per_step = []  # list of [(token_id, prob), ...] per step
+
+        # Log top-k for the first token from prefix (raw logits, not softmax)
+        first_topk = torch.topk(logits[0, 0], k=min(5, logits.shape[-1]))
+        topk_per_step.append(list(zip(first_topk.indices.tolist(), first_topk.values.tolist())))
+
+        for step in range(max_decoding_steps):
+            tok = next_token[0, 0].item()
+            if tok == EOS_TOKEN:
+                break
+            output_tokens.append(tok)
+
+            token_emb = self.paligemma_with_expert.embed_language_tokens(next_token)
+            token_emb = token_emb * emb_scale
+            token_emb = token_emb.to(dtype=prefix_embs.dtype)
+
+            pos_ids = torch.tensor([[prefix_valid_len + step]], device=device, dtype=torch.long)
+
+            NEG_INF = -2.3819763e38
+            cross = torch.where(prefix_pad_masks[0], 0.0, NEG_INF)
+            ar_part = torch.zeros(step + 1, device=device, dtype=torch.float32)
+            ar_att_4d = torch.cat([cross, ar_part], dim=0).reshape(1, 1, 1, -1)
+
+            (ar_out, _), past_kv, _ = self.paligemma_with_expert.forward(
+                attention_mask=ar_att_4d,
+                position_ids=pos_ids,
+                past_key_values=past_kv,
+                inputs_embeds=[token_emb, None],
+                use_cache=True,
+            )
+
+            logits = self.paligemma_with_expert.deembed(ar_out[:, -1:])
+            # Collect top-k raw logits before sampling
+            step_topk = torch.topk(logits[0, 0], k=min(5, logits.shape[-1]))
+            topk_per_step.append(list(zip(step_topk.indices.tolist(), step_topk.values.tolist())))
+
+            next_token = _sample_token(logits[:, 0])
+
+        return pooled, output_tokens, topk_per_step
+
+    @torch.no_grad()
     def sample_low_level_task(self, device, observation, max_decoding_steps=20, image_keys=None, return_cache=False):
         """AR-decode a subtask description from the PaliGemma prefix LM.
 

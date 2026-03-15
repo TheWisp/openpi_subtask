@@ -339,10 +339,90 @@ class PyTorchPi05Inference:
         latent_np = latent[0].float().cpu().numpy()  # [2048]
 
         total_ms = (time.time() - start_time) * 1000
-        logger.info("Prefix latent extraction: %.1fms", total_ms)
+        logger.debug("Prefix latent extraction: %.1fms", total_ms)
         return {
             "s2_latent": latent_np,
             "timing": {"total_ms": total_ms, "prefix_ms": total_ms},
+        }
+
+    async def extract_latent_with_subtask(
+        self,
+        images: dict[str, np.ndarray],
+        high_level_prompt: str,
+        state: np.ndarray | None = None,
+        max_ar_steps: int = 20,
+        temperature: float = 0.0,
+    ) -> dict[str, Any]:
+        """Extract S2 prefix latent AND AR-decode subtask in one prefix forward pass.
+
+        Runs prefix with use_cache=True, extracts latent via mean-pooling,
+        then AR-decodes subtask tokens using the cached KV. Only one prefix
+        forward (no double computation).
+        """
+        if not self._initialized:
+            await self.initialize()
+
+        start_time = time.time()
+        obs = await self._run_blocking(
+            lambda: self._prepare_observation(images, high_level_prompt, "", state),
+        )
+
+        _temp = temperature  # capture for closure
+
+        def _extract_and_decode():
+            t0 = time.time()
+            import torch as _torch
+
+            with _torch.no_grad():
+                latent, subtask_tokens, topk_per_step = self.model.extract_prefix_latent_and_subtask(
+                    self.device, obs, max_decoding_steps=max_ar_steps,
+                    image_keys=self.image_keys, temperature=_temp,
+                )
+                latent_np = latent[0].float().cpu().numpy()
+                total = (time.time() - t0) * 1000
+
+            return latent_np, subtask_tokens, topk_per_step, total
+
+        latent_np, subtask_tokens, topk_per_step, fused_ms = await self._run_blocking(
+            _extract_and_decode, use_model_lock=True
+        )
+
+        subtask_text = ""
+        if subtask_tokens:
+            try:
+                subtask_text = self.tokenizer.detokenize(np.array(subtask_tokens))
+                if ";" in subtask_text:
+                    subtask_text = subtask_text.split(";")[0].strip()
+            except Exception as e:
+                logger.warning("Failed to detokenize subtask tokens %s: %s", subtask_tokens, e)
+
+        # Log top-k alternatives at each AR step (DEBUG only — very verbose)
+        if topk_per_step and logger.isEnabledFor(logging.DEBUG):
+            for step_i, step_topk in enumerate(topk_per_step):
+                top3 = step_topk[:3]
+                parts = []
+                for tok_id, logit_val in top3:
+                    try:
+                        tok_text = self.tokenizer.detokenize(np.array([tok_id]))
+                    except Exception:
+                        tok_text = f"<{tok_id}>"
+                    parts.append(f"{tok_text!r}({tok_id}) logit={logit_val:.1f}")
+                logger.debug("  AR step %d top3: %s", step_i, " | ".join(parts))
+                if step_i >= 8:
+                    break
+
+        total_ms = (time.time() - start_time) * 1000
+        # Periodic INFO summary (every 10s), detailed timing at DEBUG
+        now = time.monotonic()
+        if not hasattr(self, '_last_subtask_log') or now - self._last_subtask_log >= 10.0:
+            self._last_subtask_log = now
+            logger.info("Latent+subtask: fused=%.1fms total=%.1fms subtask=%r", fused_ms, total_ms, subtask_text)
+        else:
+            logger.debug("Latent+subtask: fused=%.1fms total=%.1fms subtask=%r", fused_ms, total_ms, subtask_text)
+        return {
+            "s2_latent": latent_np,
+            "subtask": subtask_text,
+            "timing": {"total_ms": total_ms, "prefix_ms": fused_ms},
         }
 
     async def infer(
@@ -355,8 +435,12 @@ class PyTorchPi05Inference:
     ) -> dict[str, Any]:
         """Full Pi0.5 inference: AR-decode subtask, then generate action chunk.
 
-        Subtask tokens (including FAST tokens) are spliced at their correct positions
-        in the language buffer before the action prefix forward, matching training layout.
+        Matches JAX sample_actions() behavior: single prefix forward with KV cache
+        reuse. sample_low_level_task(return_cache=True) produces a KV cache
+        containing prefix + AR-decoded subtask tokens, then
+        sample_actions_from_cache() runs flow-matching denoising using that cache.
+        No redundant second prefix forward pass.
+
         Returns dict with 'actions', 'subtask' (str), and 'timing'.
         """
         if not self._initialized:
@@ -368,16 +452,31 @@ class PyTorchPi05Inference:
             lambda: self._prepare_observation(images, high_level_prompt, "", state),
         )
 
-        def _decode_subtask():
+        def _decode_and_act():
             t0 = time.time()
             with torch.no_grad():
-                toks = self.model.sample_low_level_task(
+                # Single prefix forward + AR subtask decode, keep KV cache
+                subtask_toks, past_kv, ext_pad_masks = self.model.sample_low_level_task(
                     self.device, obs, max_decoding_steps=max_ar_steps,
-                    image_keys=self.image_keys, return_cache=False,
+                    image_keys=self.image_keys, return_cache=True,
                 )
-            return toks, (time.time() - t0) * 1000
+            subtask_ms = (time.time() - t0) * 1000
 
-        subtask_tokens, subtask_ms = await self._run_blocking(_decode_subtask, use_model_lock=True)
+            t1 = time.time()
+            with torch.no_grad():
+                # Reuse KV cache for action denoising (matches JAX sample_actions)
+                actions = self.model.sample_actions_from_cache(
+                    self.device, past_kv, ext_pad_masks,
+                    obs.state, num_steps=num_steps,
+                )
+            action_ms = (time.time() - t1) * 1000
+
+            return subtask_toks, actions[0].float().cpu().numpy(), subtask_ms, action_ms
+
+        subtask_tokens, actions_np, subtask_ms, action_ms = await self._run_blocking(
+            _decode_and_act, use_model_lock=True
+        )
+        actions_np = self._unnormalize_actions(actions_np)
 
         subtask_text = ""
         if subtask_tokens:
@@ -385,38 +484,19 @@ class PyTorchPi05Inference:
                 subtask_text = self.tokenizer.detokenize(np.array(subtask_tokens))
                 if ";" in subtask_text:
                     subtask_text = subtask_text.split(";")[0].strip()
-                logger.info(
-                    "Decoded subtask: %r  raw_tokens=%s",
-                    subtask_text, subtask_tokens,
-                )
+                logger.debug("Decoded subtask: %r  raw_tokens=%s", subtask_text, subtask_tokens)
             except Exception as e:
                 logger.warning("Failed to detokenize subtask tokens %s: %s", subtask_tokens, e)
 
-        # Build action obs with subtask tokens spliced at the correct positions
-        # (within the fixed-length language buffer, matching training layout).
-        _st = subtask_tokens
-        obs_for_actions = await self._run_blocking(
-            lambda: self._prepare_observation(
-                images, high_level_prompt, "", state, subtask_token_ids=_st if _st else None
-            ),
-        )
-
-        def _generate():
-            t0 = time.time()
-            with torch.no_grad():
-                actions = self.model.sample_actions(
-                    self.device, obs_for_actions, num_steps=num_steps, image_keys=self.image_keys,
-                )
-            return actions[0].float().cpu().numpy(), (time.time() - t0) * 1000
-
-        actions_np, action_ms = await self._run_blocking(_generate, use_model_lock=True)
-        actions_np = self._unnormalize_actions(actions_np)
-
         total_ms = (time.time() - start_time) * 1000
-        logger.info(
-            "Full infer: subtask_ms=%.1f action_ms=%.1f total_ms=%.1f subtask=%r",
-            subtask_ms, action_ms, total_ms, subtask_text,
-        )
+        now = time.monotonic()
+        if not hasattr(self, '_last_infer_log') or now - self._last_infer_log >= 10.0:
+            self._last_infer_log = now
+            logger.info("Full infer: subtask=%.1fms action=%.1fms total=%.1fms subtask=%r",
+                        subtask_ms, action_ms, total_ms, subtask_text)
+        else:
+            logger.debug("Full infer: subtask=%.1fms action=%.1fms total=%.1fms subtask=%r",
+                         subtask_ms, action_ms, total_ms, subtask_text)
         return {
             "actions": actions_np.tolist(),
             "subtask": subtask_text,

@@ -136,12 +136,23 @@ class PyTorchPi05Server:
         state_arr = np.array(state, dtype=np.float32) if state is not None else None
 
         if mode == "extract_latent":
-            result = await self.engine.extract_latent(images, high_level_prompt, state=state_arr)
-            return {
+            with_subtask = request.get("with_subtask", False)
+            if with_subtask:
+                temperature = request.get("subtask_temperature", 0.0)
+                result = await self.engine.extract_latent_with_subtask(
+                    images, high_level_prompt, state=state_arr,
+                    temperature=temperature,
+                )
+            else:
+                result = await self.engine.extract_latent(images, high_level_prompt, state=state_arr)
+            resp = {
                 "status": "success",
                 "s2_latent": result["s2_latent"].tolist(),
                 "timing": result["timing"],
             }
+            if "subtask" in result:
+                resp["subtask"] = result["subtask"]
+            return resp
         else:
             result = await self.engine.infer(images, high_level_prompt, state=state_arr,
                                               num_steps=self.num_steps, max_ar_steps=self.max_ar_steps)
