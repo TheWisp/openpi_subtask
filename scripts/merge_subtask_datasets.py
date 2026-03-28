@@ -61,12 +61,21 @@ def main():
         else HF_LEROBOT_HOME / args.output
     )
 
-    # Load source datasets
+    # Load and verify source datasets
     print(f"Loading {len(args.sources)} source datasets...")
     datasets = []
     for repo_id in args.sources:
         print(f"  Loading {repo_id}...")
-        datasets.append(LeRobotDataset(repo_id))
+        ds = LeRobotDataset(repo_id)
+        # Verify integrity before merging — corrupted sources propagate silently
+        from lerobot.datasets.dataset_tools import verify_dataset
+        result = verify_dataset(ds.root, check_videos=False, verbose=False)
+        if not result.is_valid:
+            raise RuntimeError(
+                f"Source dataset {repo_id} failed verification with {len(result.errors)} error(s):\n"
+                + "\n".join(f"  - {e}" for e in result.errors)
+            )
+        datasets.append(ds)
 
     # Build original_task_name -> custom_subtask_name mapping from sources.
     # We map by name (not index) because aggregate_datasets remaps indices.
@@ -99,6 +108,22 @@ def main():
         f"Merged: {merged.meta.total_episodes} episodes, "
         f"{merged.meta.total_frames} frames"
     )
+
+    # Sanity check: merged episode/frame counts must equal sum of sources
+    expected_episodes = sum(ds.meta.total_episodes for ds in datasets)
+    expected_frames = sum(ds.meta.total_frames for ds in datasets)
+    if merged.meta.total_episodes != expected_episodes:
+        raise RuntimeError(
+            f"Merged episode count ({merged.meta.total_episodes}) != "
+            f"sum of sources ({expected_episodes}). "
+            f"Source datasets may have corrupted metadata — run verify_dataset on each."
+        )
+    if merged.meta.total_frames != expected_frames:
+        raise RuntimeError(
+            f"Merged frame count ({merged.meta.total_frames}) != "
+            f"sum of sources ({expected_frames}). "
+            f"Source datasets may have corrupted metadata — run verify_dataset on each."
+        )
 
     # Build task_index -> subtask_name from the MERGED dataset's tasks.
     # This uses the actual remapped task indices, not an offset guess.
@@ -173,6 +198,16 @@ def main():
     with open(info_path, "w") as f:
         json.dump(info, f, indent=4)
     print(f"Updated info.json total_tasks -> 1")
+
+    # Verify output dataset integrity
+    print("\nVerifying output dataset...")
+    output_verification = verify_dataset(output_dir, check_videos=False, verbose=False)
+    if not output_verification.is_valid:
+        print(f"WARNING: Output dataset has {len(output_verification.errors)} error(s):")
+        for e in output_verification.errors:
+            print(f"  - {e}")
+        raise RuntimeError("Output dataset failed verification — aborting")
+    print("Output dataset verified OK")
 
     print(f"\nOutput: {args.output} at {output_dir}")
     print(f"  Episodes: {result.meta.total_episodes}")
