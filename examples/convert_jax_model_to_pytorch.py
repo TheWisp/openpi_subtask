@@ -542,6 +542,7 @@ def convert_pi0_checkpoint(
 
     # Save config as JSON for reference
     config_dict = {
+        "type": "hvla_s2_vlm",
         "action_dim": model_config.action_dim,
         "action_horizon": model_config.action_horizon,
         "paligemma_variant": model_config.paligemma_variant,
